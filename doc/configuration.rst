@@ -392,6 +392,38 @@ addition of another record below a DNAME), such an RR addition is silently ignor
 However, other RRs from the same DDNS update are processed normally. This is slightly
 non-compliant with RFC 6672 (in particular, no RR occlusion takes place).
 
+.. _alias-synthesis:
+
+ALIAS record A/AAAA synthesis
+------------------------------
+
+Knot DNS supports the private ``ALIAS`` record type (type 65401).  When a zone
+node carries an ``ALIAS`` record and an incoming query requests ``A``, ``AAAA``,
+or ``ANY`` records, the server synthesises the answer from the A/AAAA records
+of the ``ALIAS`` target — provided the target name is served by a zone that is
+locally authoritative on the same server.
+
+The synthesised RRset has:
+
+- **Owner**: the original query name (the name that holds the ``ALIAS``).
+- **Type**: ``A`` or ``AAAA`` (copied from the target node).
+- **TTL**: ``min(alias_ttl, target_rr_ttl)``.
+- **Rdata**: copied verbatim from the target node's A/AAAA records.
+
+If the target name is not served by any locally authoritative zone, Knot
+returns NODATA (no synthesis is attempted for external targets in this
+version).
+
+If the query type is ``ALIAS`` itself, the raw ALIAS record is returned
+as-is without any synthesis.
+
+Other record types present on the same node (e.g. ``MX``, ``TXT``) are
+unaffected by the ``ALIAS`` record and are returned normally when queried.
+
+**DNSSEC limitation**: synthesised A/AAAA records are not signed.
+Zones that use ``ALIAS`` synthesis should not enable DNSSEC, or should
+accept that synthesised responses will be unsigned.
+
 .. _dnssec:
 
 Automatic DNSSEC signing

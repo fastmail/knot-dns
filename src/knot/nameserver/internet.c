@@ -4,12 +4,15 @@
  */
 
 #include "libknot/libknot.h"
+#include "libknot/rrtype/rdname.h"
 #include "knot/dnssec/rrset-sign.h"
 #include "knot/dnssec/zone-nsec.h"
 #include "knot/nameserver/internet.h"
 #include "knot/nameserver/nsec_proofs.h"
 #include "knot/nameserver/query_module.h"
+#include "knot/server/server.h"
 #include "knot/zone/serial.h"
+#include "knot/zone/zonedb.h"
 #include "contrib/mempattern.h"
 
 /*! \brief Check if given node was already visited. */
@@ -358,6 +361,87 @@ static knotd_in_state_t follow_cname(knot_pkt_t *pkt, uint16_t rrtype, knotd_qda
 	return KNOTD_IN_STATE_FOLLOW;
 }
 
+/*!
+ * \brief Synthesizes A/AAAA records from a locally-served ALIAS target zone.
+ *
+ * When a zone node carries an ALIAS record and the query is for A, AAAA, or
+ * ANY, look up the ALIAS target in the server's zone database.  If the target
+ * is served locally, copy its A/AAAA rdata into the answer section with the
+ * original query name as the owner, using TTL = min(alias_ttl, target_ttl).
+ *
+ * If the target is not served locally the function returns KNOTD_IN_STATE_NODATA
+ * (external resolution is not supported in this version).
+ *
+ * DNSSEC: synthesised records are not signed; this is a known limitation.
+ */
+static knotd_in_state_t follow_alias(knot_pkt_t *pkt, knotd_qdata_t *qdata)
+{
+	uint16_t qtype = knot_pkt_qtype(pkt);
+
+	knot_rrset_t alias_rr = node_rrset(qdata->extra->node, KNOT_RRTYPE_ALIAS);
+	assert(!knot_rrset_empty(&alias_rr));
+
+	const knot_dname_t *target = knot_alias_name(alias_rr.rrs.rdata);
+
+	/* Find a locally-served zone that is authoritative for the target. */
+	server_t *server = (server_t *)qdata->params->server;
+	zone_t *tgt_zone = knot_zonedb_find_suffix(server->zone_db, target);
+	if (tgt_zone == NULL || tgt_zone->contents == NULL) {
+		/* Target not served locally — cannot synthesise. */
+		return KNOTD_IN_STATE_NODATA;
+	}
+
+	/* Find the exact node for the target name. */
+	const zone_node_t *tgt_node = NULL;
+	const zone_node_t *closest = NULL;
+	const zone_node_t *previous = NULL;
+	int ret = zone_contents_find_dname(tgt_zone->contents, target,
+	                                   &tgt_node, &closest, &previous, false);
+	if (ret != ZONE_NAME_FOUND || tgt_node == NULL) {
+		return KNOTD_IN_STATE_NODATA;
+	}
+
+	/* Synthesise A and/or AAAA records depending on qtype. */
+	static const uint16_t addr_types[] = { KNOT_RRTYPE_A, KNOT_RRTYPE_AAAA };
+	bool added = false;
+
+	for (size_t i = 0; i < sizeof(addr_types) / sizeof(addr_types[0]); i++) {
+		uint16_t atype = addr_types[i];
+		if (qtype != KNOT_RRTYPE_ANY && qtype != atype) {
+			continue;
+		}
+
+		knot_rrset_t src = node_rrset(tgt_node, atype);
+		if (knot_rrset_empty(&src)) {
+			continue;
+		}
+
+		/* Build a synthetic rrset: same rdata, owner = qname, ttl capped. */
+		knot_dname_t *owner = knot_dname_copy(qdata->name, &pkt->mm);
+		if (owner == NULL) {
+			return KNOTD_IN_STATE_ERROR;
+		}
+		uint32_t ttl = MIN(alias_rr.ttl, src.ttl);
+		knot_rrset_t synth;
+		knot_rrset_init(&synth, owner, atype, src.rclass, ttl);
+		ret = knot_rdataset_copy(&synth.rrs, &src.rrs, &pkt->mm);
+		if (ret != KNOT_EOK) {
+			return KNOTD_IN_STATE_ERROR;
+		}
+
+		ret = process_query_put_rr(pkt, qdata, &synth, NULL,
+		                           KNOT_COMPR_HINT_NONE, KNOT_PF_FREE);
+		switch (ret) {
+		case KNOT_EOK:    break;
+		case KNOT_ESPACE: return KNOTD_IN_STATE_TRUNC;
+		default:          return KNOTD_IN_STATE_ERROR;
+		}
+		added = true;
+	}
+
+	return added ? KNOTD_IN_STATE_HIT : KNOTD_IN_STATE_NODATA;
+}
+
 static knotd_in_state_t name_found(knot_pkt_t *pkt, knotd_qdata_t *qdata)
 {
 	uint16_t qtype = knot_pkt_qtype(pkt);
@@ -375,6 +459,13 @@ static knotd_in_state_t name_found(knot_pkt_t *pkt, knotd_qdata_t *qdata)
 	    && qtype != KNOT_RRTYPE_NSEC
 	    && qtype != KNOT_RRTYPE_ANY) {
 		return follow_cname(pkt, KNOT_RRTYPE_CNAME, qdata);
+	}
+
+	/* ALIAS record — synthesise A/AAAA from locally-served target zone. */
+	if (node_rrtype_exists(qdata->extra->node, KNOT_RRTYPE_ALIAS)
+	    && (qtype == KNOT_RRTYPE_A || qtype == KNOT_RRTYPE_AAAA
+	        || qtype == KNOT_RRTYPE_ANY)) {
+		return follow_alias(pkt, qdata);
 	}
 
 	uint16_t old_rrcount = pkt->rrset_count;

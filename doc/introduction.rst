@@ -58,6 +58,7 @@ Server features:
 * Automatic DNSSEC key management
 * Zone data backup and restore
 * Database zone backend
+* ALIAS record query-time A/AAAA synthesis from locally-served target zones
 * Offline KSK operation
 * PKCS #11 interface
 

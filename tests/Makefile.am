@@ -79,6 +79,7 @@ check_PROGRAMS += \
 	knot/test_journal			\
 	knot/test_kasp_db			\
 	knot/test_node				\
+	knot/test_alias_synthesis		\
 	knot/test_process_query			\
 	knot/test_query_module			\
 	knot/test_requestor			\
@@ -107,6 +108,11 @@ knot_test_confdb_SOURCES = \
 
 knot_test_confio_SOURCES = \
 	knot/test_confio.c			\
+	knot/test_conf.h
+
+knot_test_alias_synthesis_SOURCES = \
+	knot/test_alias_synthesis.c		\
+	knot/test_server.h			\
 	knot/test_conf.h
 
 knot_test_process_query_SOURCES = \
