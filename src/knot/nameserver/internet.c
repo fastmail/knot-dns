@@ -362,97 +362,151 @@ static knotd_in_state_t follow_cname(knot_pkt_t *pkt, uint16_t rrtype, knotd_qda
 }
 
 /*!
- * \brief Synthesizes A/AAAA records from a locally-served ALIAS target zone.
+ * \brief Look up `target` in a locally-served zone and merge any records of
+ * type `rtype` into `*synth`, updating synth->ttl to the running minimum.
  *
- * When a zone node carries an ALIAS record and the query is for A, AAAA, or
- * ANY, look up the ALIAS target in the server's zone database.  If the target
- * is served locally, copy its A/AAAA rdata into the answer section with the
- * original query name as the owner.
+ * \return HIT if records were merged, NODATA if the target or type was not
+ *         found, ERROR on allocation failure.
+ */
+static knotd_in_state_t follow_one_alias(server_t *server, const knot_dname_t *target,
+                                         uint16_t rtype, knot_mm_t *mm, knot_rrset_t *synth)
+{
+	zone_t *tz = knot_zonedb_find_suffix(server->zone_db, target);
+	if (tz == NULL || tz->contents == NULL) {
+		return KNOTD_IN_STATE_NODATA;
+	}
+	const zone_node_t *tn = NULL, *cl = NULL, *pv = NULL;
+	if (zone_contents_find_dname(tz->contents, target, &tn, &cl, &pv, false)
+	    != ZONE_NAME_FOUND || tn == NULL) {
+		return KNOTD_IN_STATE_NODATA;
+	}
+	knot_rrset_t src = node_rrset(tn, rtype);
+	if (knot_rrset_empty(&src)) {
+		return KNOTD_IN_STATE_NODATA;
+	}
+	synth->ttl = MIN(synth->ttl, src.ttl);
+	if (knot_rdataset_merge(&synth->rrs, &src.rrs, mm) != KNOT_EOK) {
+		return KNOTD_IN_STATE_ERROR;
+	}
+	return KNOTD_IN_STATE_HIT;
+}
+
+/*!
+ * \brief Synthesises records from locally-served ALIAS target zones.
  *
- * If the ALIAS node also carries direct A/AAAA records of its own, those are
- * merged with the synthesised records into a single rrset — ALIAS behaves
- * exactly like the A records it points to, additive not replacing.
+ * When a zone node carries one or more ALIAS records, and the query is for any
+ * type except ALIAS/RRSIG/NSEC, look up the queried type in every locally-served
+ * ALIAS target and merge the results with any direct records of that type on the
+ * alias node itself — ALIAS is additive, not replacing.
  *
- * TTL = min(alias_ttl, target_ttl [, direct_ttl if present]).
+ * Multiple ALIAS rdata are followed in turn; all results are merged into a
+ * single rrset per type, analogous to how multiple A records combine.
  *
- * If the target is not served locally the direct A/AAAA records (if any) are
- * still returned; if there are none either, NODATA is returned.
+ * For qtype ANY, every non-skipped type that appears on the alias node or in
+ * any locally-served target node is synthesised.
+ *
+ * TTL = min(alias_ttl, all contributing target TTLs, direct TTL).
  *
  * DNSSEC: synthesised records are not signed; this is a known limitation.
  */
-static knotd_in_state_t follow_alias(knot_pkt_t *pkt, knotd_qdata_t *qdata)
+static knotd_in_state_t follow_aliases(knot_pkt_t *pkt, knotd_qdata_t *qdata)
 {
 	uint16_t qtype = knot_pkt_qtype(pkt);
 
 	knot_rrset_t alias_rr = node_rrset(qdata->extra->node, KNOT_RRTYPE_ALIAS);
 	assert(!knot_rrset_empty(&alias_rr));
 
-	const knot_dname_t *target = knot_alias_name(alias_rr.rrs.rdata);
-
-	/* Find a locally-served zone that is authoritative for the target. */
 	server_t *server = (server_t *)qdata->params->server;
-	zone_t *tgt_zone = knot_zonedb_find_suffix(server->zone_db, target);
-	const zone_node_t *tgt_node = NULL;
-	if (tgt_zone != NULL && tgt_zone->contents != NULL) {
-		const zone_node_t *closest = NULL;
-		const zone_node_t *previous = NULL;
-		int ret = zone_contents_find_dname(tgt_zone->contents, target,
-		                                   &tgt_node, &closest, &previous,
-		                                   false);
-		if (ret != ZONE_NAME_FOUND) {
-			tgt_node = NULL;
+
+	/* For ANY, collect the union of types across the alias node and all
+	 * locally-served targets (skipping ALIAS/RRSIG/NSEC).  For a specific
+	 * qtype, just use that single type. */
+	uint16_t types[64];
+	uint16_t ntypes = 0;
+
+	if (qtype == KNOT_RRTYPE_ANY) {
+		/* Types from the alias node's own rrsets. */
+		for (uint16_t i = 0; i < qdata->extra->node->rrset_count; i++) {
+			knot_rrset_t rs = node_rrset_at(qdata->extra->node, i);
+			if (rs.type == KNOT_RRTYPE_ALIAS ||
+			    rs.type == KNOT_RRTYPE_RRSIG ||
+			    rs.type == KNOT_RRTYPE_NSEC) {
+				continue;
+			}
+			bool dup = false;
+			for (uint16_t j = 0; j < ntypes; j++) {
+				if (types[j] == rs.type) { dup = true; break; }
+			}
+			if (!dup && ntypes < 64) {
+				types[ntypes++] = rs.type;
+			}
 		}
+
+		/* Types from each locally-served ALIAS target. */
+		knot_rdata_t *rd = alias_rr.rrs.rdata;
+		for (uint16_t i = 0; i < alias_rr.rrs.count;
+		     i++, rd = knot_rdataset_next(rd)) {
+			const knot_dname_t *tgt = knot_alias_name(rd);
+			zone_t *tz = knot_zonedb_find_suffix(server->zone_db, tgt);
+			if (tz == NULL || tz->contents == NULL) {
+				continue;
+			}
+			const zone_node_t *tn = NULL, *cl = NULL, *pv = NULL;
+			if (zone_contents_find_dname(tz->contents, tgt, &tn,
+			                             &cl, &pv, false)
+			    != ZONE_NAME_FOUND || tn == NULL) {
+				continue;
+			}
+			for (uint16_t k = 0; k < tn->rrset_count; k++) {
+				knot_rrset_t rs = node_rrset_at(tn, k);
+				if (rs.type == KNOT_RRTYPE_ALIAS ||
+				    rs.type == KNOT_RRTYPE_RRSIG ||
+				    rs.type == KNOT_RRTYPE_NSEC) {
+					continue;
+				}
+				bool dup = false;
+				for (uint16_t j = 0; j < ntypes; j++) {
+					if (types[j] == rs.type) { dup = true; break; }
+				}
+				if (!dup && ntypes < 64) {
+					types[ntypes++] = rs.type;
+				}
+			}
+		}
+	} else {
+		types[0] = qtype;
+		ntypes = 1;
 	}
 
-	/* Synthesise A and/or AAAA records depending on qtype.
-	 *
-	 * For each address type we build one synthetic rrset that is the union
-	 * of:
-	 *   - rdata from the ALIAS target node (if found locally), and
-	 *   - rdata from direct A/AAAA records on the alias node itself.
-	 *
-	 * This means ALIAS is additive: coexisting direct records are included,
-	 * and a self-referential ALIAS simply returns its own A records.
-	 */
-	static const uint16_t addr_types[] = { KNOT_RRTYPE_A, KNOT_RRTYPE_AAAA };
+	/* For each type, build one synthetic rrset = union of all target records
+	 * of that type + direct records of that type on the alias node. */
 	bool added = false;
 
-	for (size_t i = 0; i < sizeof(addr_types) / sizeof(addr_types[0]); i++) {
-		uint16_t atype = addr_types[i];
-		if (qtype != KNOT_RRTYPE_ANY && qtype != atype) {
-			continue;
-		}
+	for (uint16_t ti = 0; ti < ntypes; ti++) {
+		uint16_t rtype = types[ti];
 
-		knot_rrset_t src    = tgt_node
-		                      ? node_rrset(tgt_node, atype)
-		                      : (knot_rrset_t){ 0 };
-		knot_rrset_t direct = node_rrset(qdata->extra->node, atype);
-
-		if (knot_rrset_empty(&src) && knot_rrset_empty(&direct)) {
-			continue;
-		}
-
-		/* Compute TTL = min of all contributing sources. */
-		uint32_t ttl = alias_rr.ttl;
-		if (!knot_rrset_empty(&src))    ttl = MIN(ttl, src.ttl);
-		if (!knot_rrset_empty(&direct)) ttl = MIN(ttl, direct.ttl);
-
-		/* Build synthetic rrset with owner = qname. */
 		knot_dname_t *owner = knot_dname_copy(qdata->name, &pkt->mm);
 		if (owner == NULL) {
 			return KNOTD_IN_STATE_ERROR;
 		}
-		uint16_t rclass = !knot_rrset_empty(&src) ? src.rclass : direct.rclass;
 		knot_rrset_t synth;
-		knot_rrset_init(&synth, owner, atype, rclass, ttl);
+		knot_rrset_init(&synth, owner, rtype, KNOT_CLASS_IN, alias_rr.ttl);
 
-		if (!knot_rrset_empty(&src)) {
-			int ret = knot_rdataset_copy(&synth.rrs, &src.rrs, &pkt->mm);
-			if (ret != KNOT_EOK) {
+		/* Merge records from each locally-served ALIAS target in turn. */
+		knot_rdata_t *rdata = alias_rr.rrs.rdata;
+		for (uint16_t j = 0; j < alias_rr.rrs.count;
+		     j++, rdata = knot_rdataset_next(rdata)) {
+			if (follow_one_alias(server, knot_alias_name(rdata),
+			                     rtype, &pkt->mm, &synth)
+			    == KNOTD_IN_STATE_ERROR) {
 				return KNOTD_IN_STATE_ERROR;
 			}
 		}
+
+		/* Also merge any direct records of this type on the alias node. */
+		knot_rrset_t direct = node_rrset(qdata->extra->node, rtype);
 		if (!knot_rrset_empty(&direct)) {
+			synth.ttl = MIN(synth.ttl, direct.ttl);
 			int ret = knot_rdataset_merge(&synth.rrs, &direct.rrs,
 			                              &pkt->mm);
 			if (ret != KNOT_EOK) {
@@ -460,14 +514,17 @@ static knotd_in_state_t follow_alias(knot_pkt_t *pkt, knotd_qdata_t *qdata)
 			}
 		}
 
+		if (knot_rrset_empty(&synth)) {
+			continue;
+		}
+
 		int ret = process_query_put_rr(pkt, qdata, &synth, NULL,
 		                               KNOT_COMPR_HINT_NONE, KNOT_PF_FREE);
 		switch (ret) {
-		case KNOT_EOK:    break;
+		case KNOT_EOK:    added = true; break;
 		case KNOT_ESPACE: return KNOTD_IN_STATE_TRUNC;
 		default:          return KNOTD_IN_STATE_ERROR;
 		}
-		added = true;
 	}
 
 	return added ? KNOTD_IN_STATE_HIT : KNOTD_IN_STATE_NODATA;
@@ -492,11 +549,16 @@ static knotd_in_state_t name_found(knot_pkt_t *pkt, knotd_qdata_t *qdata)
 		return follow_cname(pkt, KNOT_RRTYPE_CNAME, qdata);
 	}
 
-	/* ALIAS record — synthesise A/AAAA from locally-served target zone. */
+	/* ALIAS record — synthesise records from locally-served target zone.
+	 * Fires for any qtype except ALIAS itself (returned as-is), RRSIG, and
+	 * NSEC.  For A/AAAA/MX/TXT/SRV/etc the matching records are copied from
+	 * the targets and merged with any direct records on this node.  For ANY
+	 * every non-skipped type from the targets and this node is synthesised. */
 	if (node_rrtype_exists(qdata->extra->node, KNOT_RRTYPE_ALIAS)
-	    && (qtype == KNOT_RRTYPE_A || qtype == KNOT_RRTYPE_AAAA
-	        || qtype == KNOT_RRTYPE_ANY)) {
-		return follow_alias(pkt, qdata);
+	    && qtype != KNOT_RRTYPE_ALIAS
+	    && qtype != KNOT_RRTYPE_RRSIG
+	    && qtype != KNOT_RRTYPE_NSEC) {
+		return follow_aliases(pkt, qdata);
 	}
 
 	uint16_t old_rrcount = pkt->rrset_count;

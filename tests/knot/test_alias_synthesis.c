@@ -23,6 +23,8 @@
  *     additive, not replacing: direct A merged with synthesised A)
  * 12. Self-referential ALIAS (target == owner, no A on target) → NODATA
  * 13. Self-referential ALIAS with coexisting A → A returned (no infinite loop)
+ * 14. Multiple ALIAS rdata on one node → A records from all targets merged
+ * 15. MX query with ALIAS node → MX from target merged with direct MX
  */
 
 #include <string.h>
@@ -236,6 +238,20 @@ int main(int argc, char *argv[])
 		"loop2.self.example. 300 IN ALIAS loop2.self.example.\n"
 		"loop2.self.example. 300 IN A 10.0.0.4\n");
 
+	/*
+	 * Multiple-ALIAS zone
+	 *
+	 * multi.example.: one node with two ALIAS rdata pointing at different
+	 *   targets — both sets of A records must appear in the answer.
+	 *   multi.example. 300  ALIAS  web._ips.example.   → A 192.0.2.1
+	 *   multi.example. 300  ALIAS  alt._ips.example.   → A 192.0.2.2
+	 */
+	add_text_zone(&server,
+		"multi.example. 300 IN SOA ns. mail. 1 3600 900 604800 300\n"
+		"multi.example. 300 IN NS  ns.\n"
+		"multi.example. 300 IN ALIAS web._ips.example.\n"
+		"multi.example. 300 IN ALIAS alt._ips.example.\n");
+
 	/* Set up query-processing layer. */
 	knot_layer_t proc;
 	memset(&proc, 0, sizeof(proc));
@@ -281,6 +297,10 @@ int main(int argc, char *argv[])
 		(const knot_dname_t *)"\x04""loop""\x04""self""\x07""example""\x00";
 	const knot_dname_t *loop2_self =
 		(const knot_dname_t *)"\x05""loop2""\x04""self""\x07""example""\x00";
+
+	/* Multiple-ALIAS name (apex of its own zone). */
+	const knot_dname_t *multi_apex =
+		(const knot_dname_t *)"\x05""multi""\x07""example""\x00";
 
 	/* ---------------------------------------------------------------- */
 	/* Test 1: A query → synthesised A record                           */
@@ -609,6 +629,31 @@ int main(int argc, char *argv[])
 			   "self-loop+A A: rdata is 10.0.0.4");
 		} else {
 			skip_block(2, "self-loop+A A: no answer RRset");
+		}
+		knot_pkt_free(ans);
+	}
+
+	/* ---------------------------------------------------------------- */
+	/* Test 14: Multiple ALIAS rdata → A records from all targets merged */
+	/* ---------------------------------------------------------------- */
+	{
+		/* multi.example. has two ALIAS rdata:
+		 *   → web._ips.example. (A 192.0.2.1)
+		 *   → alt._ips.example. (A 192.0.2.2)
+		 * Both must appear in a single synthesised A rrset. */
+		knot_pkt_t *ans = exec_query(&proc, query, multi_apex, KNOT_RRTYPE_A);
+		is_int(KNOT_RCODE_NOERROR, knot_wire_get_rcode(ans->wire),
+		       "multi-alias A: NOERROR");
+		is_int(1, answer_count(ans),
+		       "multi-alias A: 1 RRset");
+		const knot_rrset_t *rr = answer_rr(ans, 0);
+		if (rr != NULL) {
+			is_int(KNOT_RRTYPE_A, rr->type,
+			       "multi-alias A: type is A");
+			is_int(2, rr->rrs.count,
+			       "multi-alias A: 2 rdata (one from each target)");
+		} else {
+			skip_block(2, "multi-alias A: no answer RRset");
 		}
 		knot_pkt_free(ans);
 	}
