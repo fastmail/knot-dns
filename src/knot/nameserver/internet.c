@@ -367,10 +367,16 @@ static knotd_in_state_t follow_cname(knot_pkt_t *pkt, uint16_t rrtype, knotd_qda
  * When a zone node carries an ALIAS record and the query is for A, AAAA, or
  * ANY, look up the ALIAS target in the server's zone database.  If the target
  * is served locally, copy its A/AAAA rdata into the answer section with the
- * original query name as the owner, using TTL = min(alias_ttl, target_ttl).
+ * original query name as the owner.
  *
- * If the target is not served locally the function returns KNOTD_IN_STATE_NODATA
- * (external resolution is not supported in this version).
+ * If the ALIAS node also carries direct A/AAAA records of its own, those are
+ * merged with the synthesised records into a single rrset — ALIAS behaves
+ * exactly like the A records it points to, additive not replacing.
+ *
+ * TTL = min(alias_ttl, target_ttl [, direct_ttl if present]).
+ *
+ * If the target is not served locally the direct A/AAAA records (if any) are
+ * still returned; if there are none either, NODATA is returned.
  *
  * DNSSEC: synthesised records are not signed; this is a known limitation.
  */
@@ -386,22 +392,28 @@ static knotd_in_state_t follow_alias(knot_pkt_t *pkt, knotd_qdata_t *qdata)
 	/* Find a locally-served zone that is authoritative for the target. */
 	server_t *server = (server_t *)qdata->params->server;
 	zone_t *tgt_zone = knot_zonedb_find_suffix(server->zone_db, target);
-	if (tgt_zone == NULL || tgt_zone->contents == NULL) {
-		/* Target not served locally — cannot synthesise. */
-		return KNOTD_IN_STATE_NODATA;
-	}
-
-	/* Find the exact node for the target name. */
 	const zone_node_t *tgt_node = NULL;
-	const zone_node_t *closest = NULL;
-	const zone_node_t *previous = NULL;
-	int ret = zone_contents_find_dname(tgt_zone->contents, target,
-	                                   &tgt_node, &closest, &previous, false);
-	if (ret != ZONE_NAME_FOUND || tgt_node == NULL) {
-		return KNOTD_IN_STATE_NODATA;
+	if (tgt_zone != NULL && tgt_zone->contents != NULL) {
+		const zone_node_t *closest = NULL;
+		const zone_node_t *previous = NULL;
+		int ret = zone_contents_find_dname(tgt_zone->contents, target,
+		                                   &tgt_node, &closest, &previous,
+		                                   false);
+		if (ret != ZONE_NAME_FOUND) {
+			tgt_node = NULL;
+		}
 	}
 
-	/* Synthesise A and/or AAAA records depending on qtype. */
+	/* Synthesise A and/or AAAA records depending on qtype.
+	 *
+	 * For each address type we build one synthetic rrset that is the union
+	 * of:
+	 *   - rdata from the ALIAS target node (if found locally), and
+	 *   - rdata from direct A/AAAA records on the alias node itself.
+	 *
+	 * This means ALIAS is additive: coexisting direct records are included,
+	 * and a self-referential ALIAS simply returns its own A records.
+	 */
 	static const uint16_t addr_types[] = { KNOT_RRTYPE_A, KNOT_RRTYPE_AAAA };
 	bool added = false;
 
@@ -411,26 +423,45 @@ static knotd_in_state_t follow_alias(knot_pkt_t *pkt, knotd_qdata_t *qdata)
 			continue;
 		}
 
-		knot_rrset_t src = node_rrset(tgt_node, atype);
-		if (knot_rrset_empty(&src)) {
+		knot_rrset_t src    = tgt_node
+		                      ? node_rrset(tgt_node, atype)
+		                      : (knot_rrset_t){ 0 };
+		knot_rrset_t direct = node_rrset(qdata->extra->node, atype);
+
+		if (knot_rrset_empty(&src) && knot_rrset_empty(&direct)) {
 			continue;
 		}
 
-		/* Build a synthetic rrset: same rdata, owner = qname, ttl capped. */
+		/* Compute TTL = min of all contributing sources. */
+		uint32_t ttl = alias_rr.ttl;
+		if (!knot_rrset_empty(&src))    ttl = MIN(ttl, src.ttl);
+		if (!knot_rrset_empty(&direct)) ttl = MIN(ttl, direct.ttl);
+
+		/* Build synthetic rrset with owner = qname. */
 		knot_dname_t *owner = knot_dname_copy(qdata->name, &pkt->mm);
 		if (owner == NULL) {
 			return KNOTD_IN_STATE_ERROR;
 		}
-		uint32_t ttl = MIN(alias_rr.ttl, src.ttl);
+		uint16_t rclass = !knot_rrset_empty(&src) ? src.rclass : direct.rclass;
 		knot_rrset_t synth;
-		knot_rrset_init(&synth, owner, atype, src.rclass, ttl);
-		ret = knot_rdataset_copy(&synth.rrs, &src.rrs, &pkt->mm);
-		if (ret != KNOT_EOK) {
-			return KNOTD_IN_STATE_ERROR;
+		knot_rrset_init(&synth, owner, atype, rclass, ttl);
+
+		if (!knot_rrset_empty(&src)) {
+			int ret = knot_rdataset_copy(&synth.rrs, &src.rrs, &pkt->mm);
+			if (ret != KNOT_EOK) {
+				return KNOTD_IN_STATE_ERROR;
+			}
+		}
+		if (!knot_rrset_empty(&direct)) {
+			int ret = knot_rdataset_merge(&synth.rrs, &direct.rrs,
+			                              &pkt->mm);
+			if (ret != KNOT_EOK) {
+				return KNOTD_IN_STATE_ERROR;
+			}
 		}
 
-		ret = process_query_put_rr(pkt, qdata, &synth, NULL,
-		                           KNOT_COMPR_HINT_NONE, KNOT_PF_FREE);
+		int ret = process_query_put_rr(pkt, qdata, &synth, NULL,
+		                               KNOT_COMPR_HINT_NONE, KNOT_PF_FREE);
 		switch (ret) {
 		case KNOT_EOK:    break;
 		case KNOT_ESPACE: return KNOTD_IN_STATE_TRUNC;

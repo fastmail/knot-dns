@@ -11,9 +11,18 @@
  *  2. AAAA query → synthesised AAAA record
  *  3. ANY query  → synthesised A + AAAA
  *  4. ALIAS qtype → ALIAS record returned as-is (no synthesis)
- *  5. MX query with ALIAS present → NODATA (synthesis only for A/AAAA/ANY)
+ *  5. MX query with ALIAS present → real MX returned
  *  6. A query, ALIAS target not in any local zone → NODATA
  *  7. TTL capping: synthesised TTL = min(alias_ttl, target_ttl)
+ *  8. Wildcard ALIAS, specific override is a plain A → override wins
+ *  9. Wildcard plain A, specific override is ALIAS → synthesis for specific,
+ *     wildcard A for uncovered names
+ * 10. Wildcard ALIAS, specific override is also ALIAS (different target) →
+ *     each synthesises from its own target
+ * 11. A record and ALIAS coexist on the same node → both combined (ALIAS is
+ *     additive, not replacing: direct A merged with synthesised A)
+ * 12. Self-referential ALIAS (target == owner, no A on target) → NODATA
+ * 13. Self-referential ALIAS with coexisting A → A returned (no infinite loop)
  */
 
 #include <string.h>
@@ -144,12 +153,14 @@ int main(int argc, char *argv[])
 
 	/* Target zone: _ips.example.
 	 *   web._ips.example.  300  A    192.0.2.1
-	 *   web._ips.example.  300  AAAA 2001:db8::1          */
+	 *   web._ips.example.  300  AAAA 2001:db8::1
+	 *   alt._ips.example.  300  A    192.0.2.2           */
 	add_text_zone(&server,
 		"_ips.example. 300 IN SOA ns. mail. 1 3600 900 604800 300\n"
 		"_ips.example. 300 IN NS  ns.\n"
 		"web._ips.example. 300 IN A    192.0.2.1\n"
-		"web._ips.example. 300 IN AAAA 2001:db8::1\n");
+		"web._ips.example. 300 IN AAAA 2001:db8::1\n"
+		"alt._ips.example. 300 IN A    192.0.2.2\n");
 
 	/* Alias zone: example.
 	 *   www.example.  600  ALIAS  web._ips.example.
@@ -166,6 +177,64 @@ int main(int argc, char *argv[])
 		"other.example. 300 IN SOA ns. mail. 1 3600 900 604800 300\n"
 		"other.example. 300 IN NS  ns.\n"
 		"www.other.example. 300 IN ALIAS web.external.tld.\n");
+
+	/*
+	 * Wildcard test zones
+	 *
+	 * wild1.example.: wildcard is ALIAS, specific override is plain A
+	 *   *.wild1.example.     300  ALIAS  web._ips.example.
+	 *   over.wild1.example.  300  A      10.0.0.1
+	 *
+	 * wild2.example.: wildcard is plain A, specific override is ALIAS
+	 *   *.wild2.example.     300  A      10.0.0.2
+	 *   login.wild2.example. 300  ALIAS  web._ips.example.
+	 *
+	 * wild3.example.: both wildcard and override are ALIAS, different targets
+	 *   *.wild3.example.     300  ALIAS  web._ips.example.
+	 *   other.wild3.example. 300  ALIAS  alt._ips.example.
+	 */
+	add_text_zone(&server,
+		"wild1.example. 300 IN SOA ns. mail. 1 3600 900 604800 300\n"
+		"wild1.example. 300 IN NS  ns.\n"
+		"*.wild1.example. 300 IN ALIAS web._ips.example.\n"
+		"over.wild1.example. 300 IN A 10.0.0.1\n");
+
+	add_text_zone(&server,
+		"wild2.example. 300 IN SOA ns. mail. 1 3600 900 604800 300\n"
+		"wild2.example. 300 IN NS  ns.\n"
+		"*.wild2.example. 300 IN A 10.0.0.2\n"
+		"login.wild2.example. 300 IN ALIAS web._ips.example.\n");
+
+	add_text_zone(&server,
+		"wild3.example. 300 IN SOA ns. mail. 1 3600 900 604800 300\n"
+		"wild3.example. 300 IN NS  ns.\n"
+		"*.wild3.example. 300 IN ALIAS web._ips.example.\n"
+		"other.wild3.example. 300 IN ALIAS alt._ips.example.\n");
+
+	/*
+	 * Coexistence and self-reference zones
+	 *
+	 * coex.example.: ALIAS and A coexist on the same node
+	 *   both.coex.example. 300  ALIAS  web._ips.example.
+	 *   both.coex.example. 300  A      10.0.0.3   ← shadowed by ALIAS for A queries
+	 *
+	 * self.example.: self-referential ALIAS
+	 *   loop.self.example. 300  ALIAS  loop.self.example.  ← no A → NODATA
+	 *   loop2.self.example. 300 ALIAS  loop2.self.example.
+	 *   loop2.self.example. 300 A      10.0.0.4            ← ALIAS+A self-ref
+	 */
+	add_text_zone(&server,
+		"coex.example. 300 IN SOA ns. mail. 1 3600 900 604800 300\n"
+		"coex.example. 300 IN NS  ns.\n"
+		"both.coex.example. 300 IN ALIAS web._ips.example.\n"
+		"both.coex.example. 300 IN A 10.0.0.3\n");
+
+	add_text_zone(&server,
+		"self.example. 300 IN SOA ns. mail. 1 3600 900 604800 300\n"
+		"self.example. 300 IN NS  ns.\n"
+		"loop.self.example. 300 IN ALIAS loop.self.example.\n"
+		"loop2.self.example. 300 IN ALIAS loop2.self.example.\n"
+		"loop2.self.example. 300 IN A 10.0.0.4\n");
 
 	/* Set up query-processing layer. */
 	knot_layer_t proc;
@@ -190,6 +259,28 @@ int main(int argc, char *argv[])
 		(const knot_dname_t *)"\x03""www""\x07""example""\x00";
 	const knot_dname_t *www_other =
 		(const knot_dname_t *)"\x03""www""\x05""other""\x07""example""\x00";
+
+	/* Wildcard test names. */
+	const knot_dname_t *over_wild1 =
+		(const knot_dname_t *)"\x04""over""\x05""wild1""\x07""example""\x00";
+	const knot_dname_t *any_wild1 =
+		(const knot_dname_t *)"\x03""any""\x05""wild1""\x07""example""\x00";
+	const knot_dname_t *login_wild2 =
+		(const knot_dname_t *)"\x05""login""\x05""wild2""\x07""example""\x00";
+	const knot_dname_t *other_wild2 =
+		(const knot_dname_t *)"\x05""other""\x05""wild2""\x07""example""\x00";
+	const knot_dname_t *any_wild3 =
+		(const knot_dname_t *)"\x03""any""\x05""wild3""\x07""example""\x00";
+	const knot_dname_t *other_wild3 =
+		(const knot_dname_t *)"\x05""other""\x05""wild3""\x07""example""\x00";
+
+	/* Coexistence and self-reference names. */
+	const knot_dname_t *both_coex =
+		(const knot_dname_t *)"\x04""both""\x04""coex""\x07""example""\x00";
+	const knot_dname_t *loop_self =
+		(const knot_dname_t *)"\x04""loop""\x04""self""\x07""example""\x00";
+	const knot_dname_t *loop2_self =
+		(const knot_dname_t *)"\x05""loop2""\x04""self""\x07""example""\x00";
 
 	/* ---------------------------------------------------------------- */
 	/* Test 1: A query → synthesised A record                           */
@@ -322,6 +413,202 @@ int main(int argc, char *argv[])
 			   rr->ttl);
 		} else {
 			skip("alias TTL: no answer RRset to check TTL");
+		}
+		knot_pkt_free(ans);
+	}
+
+	/* ---------------------------------------------------------------- */
+	/* Test 8: Wildcard ALIAS, specific override is plain A              */
+	/*   over.wild1: A 10.0.0.1 (specific) wins over *.wild1 ALIAS      */
+	/*   any.wild1:  *.wild1 ALIAS fires → synthesis from web._ips       */
+	/* ---------------------------------------------------------------- */
+	{
+		/* 8a: specific A overrides wildcard ALIAS */
+		knot_pkt_t *ans = exec_query(&proc, query, over_wild1, KNOT_RRTYPE_A);
+		is_int(KNOT_RCODE_NOERROR, knot_wire_get_rcode(ans->wire),
+		       "wc8a override-wins A: NOERROR");
+		is_int(1, answer_count(ans),
+		       "wc8a override-wins A: 1 RRset");
+		const knot_rrset_t *rr = answer_rr(ans, 0);
+		if (rr != NULL) {
+			is_int(KNOT_RRTYPE_A, rr->type,
+			       "wc8a override-wins A: type is A");
+			ok(rr->rrs.rdata != NULL &&
+			   rr->rrs.rdata->len == 4 &&
+			   memcmp(rr->rrs.rdata->data, "\x0a\x00\x00\x01", 4) == 0,
+			   "wc8a override-wins A: rdata is 10.0.0.1");
+		} else {
+			skip_block(2, "wc8a: no answer RRset");
+		}
+		knot_pkt_free(ans);
+
+		/* 8b: uncovered name hits wildcard ALIAS → synthesis */
+		ans = exec_query(&proc, query, any_wild1, KNOT_RRTYPE_A);
+		is_int(KNOT_RCODE_NOERROR, knot_wire_get_rcode(ans->wire),
+		       "wc8b wildcard-alias A: NOERROR");
+		is_int(1, answer_count(ans),
+		       "wc8b wildcard-alias A: 1 RRset");
+		rr = answer_rr(ans, 0);
+		if (rr != NULL) {
+			is_int(KNOT_RRTYPE_A, rr->type,
+			       "wc8b wildcard-alias A: type is A (synthesised)");
+			ok(rr->rrs.rdata != NULL &&
+			   rr->rrs.rdata->len == 4 &&
+			   memcmp(rr->rrs.rdata->data, "\xc0\x00\x02\x01", 4) == 0,
+			   "wc8b wildcard-alias A: rdata is 192.0.2.1");
+		} else {
+			skip_block(2, "wc8b: no answer RRset");
+		}
+		knot_pkt_free(ans);
+	}
+
+	/* ---------------------------------------------------------------- */
+	/* Test 9: Wildcard plain A, specific override is ALIAS              */
+	/*   login.wild2: ALIAS → synthesis (192.0.2.1)                      */
+	/*   other.wild2: wildcard A 10.0.0.2                                */
+	/* ---------------------------------------------------------------- */
+	{
+		/* 9a: specific ALIAS overrides wildcard A → synthesis */
+		knot_pkt_t *ans = exec_query(&proc, query, login_wild2, KNOT_RRTYPE_A);
+		is_int(KNOT_RCODE_NOERROR, knot_wire_get_rcode(ans->wire),
+		       "wc9a alias-overrides-wc A: NOERROR");
+		is_int(1, answer_count(ans),
+		       "wc9a alias-overrides-wc A: 1 RRset");
+		const knot_rrset_t *rr = answer_rr(ans, 0);
+		if (rr != NULL) {
+			is_int(KNOT_RRTYPE_A, rr->type,
+			       "wc9a alias-overrides-wc A: type is A (synthesised)");
+			ok(rr->rrs.rdata != NULL &&
+			   rr->rrs.rdata->len == 4 &&
+			   memcmp(rr->rrs.rdata->data, "\xc0\x00\x02\x01", 4) == 0,
+			   "wc9a alias-overrides-wc A: rdata is 192.0.2.1 (not wildcard)");
+		} else {
+			skip_block(2, "wc9a: no answer RRset");
+		}
+		knot_pkt_free(ans);
+
+		/* 9b: uncovered name hits wildcard A (no synthesis) */
+		ans = exec_query(&proc, query, other_wild2, KNOT_RRTYPE_A);
+		is_int(KNOT_RCODE_NOERROR, knot_wire_get_rcode(ans->wire),
+		       "wc9b wildcard-A: NOERROR");
+		is_int(1, answer_count(ans),
+		       "wc9b wildcard-A: 1 RRset");
+		rr = answer_rr(ans, 0);
+		if (rr != NULL) {
+			is_int(KNOT_RRTYPE_A, rr->type,
+			       "wc9b wildcard-A: type is A");
+			ok(rr->rrs.rdata != NULL &&
+			   rr->rrs.rdata->len == 4 &&
+			   memcmp(rr->rrs.rdata->data, "\x0a\x00\x00\x02", 4) == 0,
+			   "wc9b wildcard-A: rdata is 10.0.0.2 (wildcard, not synthesised)");
+		} else {
+			skip_block(2, "wc9b: no answer RRset");
+		}
+		knot_pkt_free(ans);
+	}
+
+	/* ---------------------------------------------------------------- */
+	/* Test 10: Both wildcard and override are ALIAS, different targets   */
+	/*   any.wild3: *.wild3 ALIAS web._ips → 192.0.2.1                   */
+	/*   other.wild3: other.wild3 ALIAS alt._ips → 192.0.2.2             */
+	/* ---------------------------------------------------------------- */
+	{
+		/* 10a: wildcard ALIAS synthesis (web._ips → 192.0.2.1) */
+		knot_pkt_t *ans = exec_query(&proc, query, any_wild3, KNOT_RRTYPE_A);
+		is_int(KNOT_RCODE_NOERROR, knot_wire_get_rcode(ans->wire),
+		       "wc10a both-alias wildcard A: NOERROR");
+		is_int(1, answer_count(ans),
+		       "wc10a both-alias wildcard A: 1 RRset");
+		const knot_rrset_t *rr = answer_rr(ans, 0);
+		if (rr != NULL) {
+			is_int(KNOT_RRTYPE_A, rr->type,
+			       "wc10a both-alias wildcard A: type is A");
+			ok(rr->rrs.rdata != NULL &&
+			   rr->rrs.rdata->len == 4 &&
+			   memcmp(rr->rrs.rdata->data, "\xc0\x00\x02\x01", 4) == 0,
+			   "wc10a both-alias wildcard A: rdata is 192.0.2.1 (web target)");
+		} else {
+			skip_block(2, "wc10a: no answer RRset");
+		}
+		knot_pkt_free(ans);
+
+		/* 10b: specific ALIAS override synthesis (alt._ips → 192.0.2.2) */
+		ans = exec_query(&proc, query, other_wild3, KNOT_RRTYPE_A);
+		is_int(KNOT_RCODE_NOERROR, knot_wire_get_rcode(ans->wire),
+		       "wc10b both-alias specific A: NOERROR");
+		is_int(1, answer_count(ans),
+		       "wc10b both-alias specific A: 1 RRset");
+		rr = answer_rr(ans, 0);
+		if (rr != NULL) {
+			is_int(KNOT_RRTYPE_A, rr->type,
+			       "wc10b both-alias specific A: type is A");
+			ok(rr->rrs.rdata != NULL &&
+			   rr->rrs.rdata->len == 4 &&
+			   memcmp(rr->rrs.rdata->data, "\xc0\x00\x02\x02", 4) == 0,
+			   "wc10b both-alias specific A: rdata is 192.0.2.2 (alt target, not wildcard)");
+		} else {
+			skip_block(2, "wc10b: no answer RRset");
+		}
+		knot_pkt_free(ans);
+	}
+
+	/* ---------------------------------------------------------------- */
+	/* Test 11: A record and ALIAS coexist — both combined into one rrset */
+	/* ---------------------------------------------------------------- */
+	{
+		/* both.coex has ALIAS→web._ips (192.0.2.1) AND A 10.0.0.3.
+		 * Expect both addresses in a single A rrset. */
+		knot_pkt_t *ans = exec_query(&proc, query, both_coex, KNOT_RRTYPE_A);
+		is_int(KNOT_RCODE_NOERROR, knot_wire_get_rcode(ans->wire),
+		       "coex A: NOERROR");
+		is_int(1, answer_count(ans),
+		       "coex A: 1 RRset (merged ALIAS+direct)");
+		const knot_rrset_t *rr = answer_rr(ans, 0);
+		if (rr != NULL) {
+			is_int(KNOT_RRTYPE_A, rr->type,
+			       "coex A: type is A");
+			/* Merged rrset must have 2 rdata (192.0.2.1 + 10.0.0.3). */
+			is_int(2, rr->rrs.count,
+			       "coex A: 2 rdata (synthesised + direct)");
+		} else {
+			skip_block(2, "coex A: no answer RRset");
+		}
+		knot_pkt_free(ans);
+	}
+
+	/* ---------------------------------------------------------------- */
+	/* Test 12: Self-referential ALIAS, no A on the node → NODATA        */
+	/* ---------------------------------------------------------------- */
+	{
+		knot_pkt_t *ans = exec_query(&proc, query, loop_self, KNOT_RRTYPE_A);
+		is_int(KNOT_RCODE_NOERROR, knot_wire_get_rcode(ans->wire),
+		       "self-loop A: NOERROR (not SERVFAIL)");
+		is_int(0, answer_count(ans),
+		       "self-loop A: 0 records (NODATA, no infinite loop)");
+		knot_pkt_free(ans);
+	}
+
+	/* ---------------------------------------------------------------- */
+	/* Test 13: Self-referential ALIAS with coexisting A → A returned    */
+	/* ---------------------------------------------------------------- */
+	{
+		/* loop2 has ALIAS→itself AND A 10.0.0.4.
+		 * follow_alias() finds the same node, picks up A 10.0.0.4. */
+		knot_pkt_t *ans = exec_query(&proc, query, loop2_self, KNOT_RRTYPE_A);
+		is_int(KNOT_RCODE_NOERROR, knot_wire_get_rcode(ans->wire),
+		       "self-loop+A A: NOERROR");
+		is_int(1, answer_count(ans),
+		       "self-loop+A A: 1 RRset");
+		const knot_rrset_t *rr = answer_rr(ans, 0);
+		if (rr != NULL) {
+			is_int(KNOT_RRTYPE_A, rr->type,
+			       "self-loop+A A: type is A");
+			ok(rr->rrs.rdata != NULL &&
+			   rr->rrs.rdata->len == 4 &&
+			   memcmp(rr->rrs.rdata->data, "\x0a\x00\x00\x04", 4) == 0,
+			   "self-loop+A A: rdata is 10.0.0.4");
+		} else {
+			skip_block(2, "self-loop+A A: no answer RRset");
 		}
 		knot_pkt_free(ans);
 	}
